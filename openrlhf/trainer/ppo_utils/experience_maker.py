@@ -1017,12 +1017,12 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             skip_special_tokens=kwargs.get("skip_special_tokens", False),
         )
         all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_solutions = sum([[solution] * args.n_samples_per_prompt for solution in all_solutions], [])
+        all_gt_solutions = sum([[solution] * args.n_samples_per_prompt for solution in all_solutions], [])
         samples_list = []
         # list[list[str]:num_rollouts]
         all_model_solutions = []
 
-        for user_question, gt_solution in zip(all_prompts, all_solutions):
+        for user_question, gt_solution in zip(all_prompts, all_gt_solutions):
             gt_answer = self.evaluator.extract_answer_from_gold_solution(gt_solution)
             #! build an MCTS searcher
             mcts_searcher = MCTS_Searcher(
