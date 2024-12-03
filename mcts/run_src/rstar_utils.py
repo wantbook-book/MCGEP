@@ -655,6 +655,13 @@ def find_best_solution(root_node, evaluator, enable_potential_score=False):
             return node.subanswer
         elif node.node_type is Node_Type.DIRECT_ANSWER:
             return node.direct_answer
+        # TODO: 会影响原来的动作mcts
+        elif node.node_type is Node_Type.OST_STEP:
+            if reach_terminal_ost_step(node.ost_step):
+                existing_ost_steps, next_ost_step_id = concat_ost_steps(node.solution_trace)
+                return existing_ost_steps
+            else:
+                return None
         else:
             return None
 
@@ -706,6 +713,14 @@ def stochastic_find_best_solution(
             return node.subanswer
         elif node.node_type is Node_Type.DIRECT_ANSWER:
             return node.direct_answer
+        # ----jia
+        elif node.node_type is Node_Type.OST_STEP:
+            if reach_terminal_ost_step(node.ost_step):
+                existing_ost_steps, next_ost_step_id = concat_ost_steps(node.solution_trace)
+                return existing_ost_steps
+            else:
+                return None
+        # ----jia
         else:
             return None
 

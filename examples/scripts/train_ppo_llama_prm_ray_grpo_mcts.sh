@@ -2,7 +2,7 @@ set -x
 export CUDA_VISIBLE_DEVICES=4,5,6,7
 wandb_token=b0255391060d68833e9b98941b9eb94fe770fbe4
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{"working_dir": "/pubshare/fwk/code/openRLHF_org2"}' \
+   --runtime-env-json='{"working_dir": "/pubshare/fwk/code/MCGEP"}' \
    -- python3 -m openrlhf.cli.train_ppo_prm_ray_mcts \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 1 \
@@ -24,10 +24,10 @@ ray job submit --address="http://127.0.0.1:8265" \
    --vocab_size 32000 \
    --use_prm \
    --save_path /pubshare/fwk/orlhf_checkpoints/checkpoint/llama3-1b-porm_grpo_n2_mcts \
-   --micro_train_batch_size 8 \
-   --train_batch_size 16 \
-   --micro_rollout_batch_size 8 \
-   --rollout_batch_size 16 \
+   --micro_train_batch_size 1 \
+   --train_batch_size 1 \
+   --micro_rollout_batch_size 1 \
+   --rollout_batch_size 1 \
    --max_samples 100000 \
    --max_epochs 1 \
    --prompt_max_len 1024 \
@@ -55,7 +55,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --data_root /pubshare/fwk/code/openRLHF_org2/mcts/data \
    --prompts_root /pubshare/fwk/code/openRLHF_org2/mcts/prompts \
    --run_outputs_root /pubshare/fwk/code/openRLHF_org2/run_outputs \
-   --mcts
+   --mcts_mode full_actions
 
    # --save_tree \
    #  --model_ckpt mistralai/Mistral-7B-v0.1 \

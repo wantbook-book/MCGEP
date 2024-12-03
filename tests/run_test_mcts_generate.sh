@@ -1,5 +1,5 @@
 set -x 
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=4,5
 wandb_token=b0255391060d68833e9b98941b9eb94fe770fbe4
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{"working_dir": "/pubshare/fwk/code/openRLHF_org2"}' \
@@ -16,7 +16,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --vllm_tensor_parallel_size 1 \
    --colocate_critic_reward \
    --colocate_actor_ref \
-   --pretrain /home/jovyan/share/LLMAgent/model/Llama-3.2-1B-Instruct \
+   --pretrain mistralai/Mistral-7B-v0.1 \
    --reward_pretrain /pubshare/LLM/math-shepherd-mistral-7b-prm \
    --advantage_estimator group_norm \
    --n_samples_per_prompt 2 \
@@ -50,7 +50,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    --wandb_relogin True \
    --dataset_name GSM8K \
     --test_json_filename test_all \
-    --model_ckpt mistralai/Mistral-7B-v0.1 \
     --note 10q \
     --num_rollouts 16 \
     --end_idx 10 \

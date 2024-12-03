@@ -41,7 +41,7 @@ class ActorPPOTrainer(PPOTrainer):
         super().__init__(*args, **kwargs)
         self.remote_rm_url = remote_rm_url
         self.vllm_engines = vllm_engines
-        if self.strategy.args.mcts:
+        if self.strategy.args.mcts_mode:
             self.vllm_generator = VllmGenerator(self.strategy, self.vllm_engines)
             self.evaluator = eval(f"{self.strategy.args.dataset_name}Evaluator()")
         else:

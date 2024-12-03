@@ -394,7 +394,7 @@ if __name__ == "__main__":
 
     # performance tuning
     parser.add_argument("--perf", action="store_true", default=False)
-    parser.add_argument('--mcts', action='store_true', default=False, help='Use MCTS sampling')
+    parser.add_argument('--mcts_mode', default='', choices=['only_ost', 'full_actions'], help='Use MCTS sampling')
     args = parser.parse_args()
 
     if args.advantage_estimator not in ["gae"]:
