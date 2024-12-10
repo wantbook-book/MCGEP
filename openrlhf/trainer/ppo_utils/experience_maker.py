@@ -2,6 +2,7 @@ import logging
 import time
 from abc import ABC
 import os 
+import re
 from copy import deepcopy
 import json
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from tqdm import trange
 import ray
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 
 from openrlhf.models.actor import Actor
@@ -126,6 +128,8 @@ class Samples:
     response_length: torch.Tensor
     total_length: torch.Tensor
     rewards: Optional[torch.Tensor] = None
+    token_counters: Optional[list[int]] = None
+    call_counters: Optional[list[int]] = None
 
 
 class NaiveExperienceMaker(ABC):
@@ -252,28 +256,61 @@ class NaiveExperienceMaker(ABC):
     
     @torch.no_grad()
     def get_grpo_advantages(self, experiences: List[Experience], n_samples_per_prompt: int) -> List[Experience]:
+        use_prm = self.strategy.args.use_prm
         all_advantages = []
-        micro_rollout_bsz = experiences[0].info["reward"].size(0)
-        all_rewards = torch.concat([experience.info["reward"] for experience in experiences])
-        for i in range(0, all_rewards.size(0), n_samples_per_prompt):
-            rewards = all_rewards[i: i + n_samples_per_prompt]
-            mean = rewards.mean()
-            std = rewards.std()
-            advantages = (rewards - mean) / (std + 1e-8)
-            all_advantages.append(advantages)
-        all_advantages = torch.concat(all_advantages)
-        all_advantages = all_advantages.reshape(-1, micro_rollout_bsz)
-        all_advantages = torch.unbind(all_advantages)
+        if use_prm:
+            micro_rollout_bsz = len(experiences[0].info["reward"])
+            all_rewards = [reward for experience in experiences for reward in experience.info["reward"]]
+        else:
+            micro_rollout_bsz = experiences[0].info["reward"].size(0)
+            # 16个(4,1) -> (64,1)
+            all_rewards = torch.concat([experience.info["reward"] for experience in experiences])
+        if use_prm:
+            for i in range(0, len(all_rewards), n_samples_per_prompt):
+                rewards = all_rewards[i: i + n_samples_per_prompt]
+                returns = []
+                for reward in rewards:
+                    cumsum_reverse = torch.cumsum(reward.flip(0), dim=0).flip(0)
+                    returns.append(cumsum_reverse)
+                cat_returns = torch.cat(returns)
+                mean = cat_returns.mean()
+                std = cat_returns.std()
+                for _return in returns:
+                    all_advantages.append((_return-mean)/(std+1e-8))
+            # 改成(-1, micro_batchsize)
+            _all_advantages = []
+            for i in range(0, len(all_advantages), micro_rollout_bsz):
+                _all_advantages.append(all_advantages[i: i + micro_rollout_bsz])
+            all_advantages = _all_advantages
+        else:
+            for i in range(0, all_rewards.size(0), n_samples_per_prompt):
+                # (4,1)
+                rewards = all_rewards[i: i + n_samples_per_prompt]
+                mean = rewards.mean()
+                std = rewards.std()
+                advantages = (rewards - mean) / (std + 1e-8)
+                all_advantages.append(advantages)
+            # (64,1)
+            all_advantages = torch.concat(all_advantages)
+            all_advantages = all_advantages.reshape(-1, micro_rollout_bsz)
+            # (16,4)
+            all_advantages = torch.unbind(all_advantages)
         if not self.packing_samples:
             for i, experience in enumerate(experiences):
                 experience.advantages = all_advantages[i].unsqueeze(1).expand(
                     experiences[i].action_mask.shape).detach()
         else:
             for experience, advantages in zip(experiences, all_advantages):
-                packed_advantages = []
-                for i, num_action in enumerate(experience.info["num_actions"]):
-                    packed_advantages.append(advantages[i].expand(num_action))
-                experience.advantages = packed_advantages
+                if use_prm:
+                    experience.advantages = advantages
+                    experience.info["reward"] = torch.tensor([reward.mean() for reward in experience.info["reward"]]).reshape(-1, 1)
+                else:
+                    packed_advantages = []
+                    # 判断如果维度足够了，就不需要expand
+                    for i, num_action in enumerate(experience.info["num_actions"]):
+                        # num_action 每个不一样
+                        packed_advantages.append(advantages[i].expand(num_action))
+                    experience.advantages = packed_advantages
         return experiences
     
     @torch.no_grad()
@@ -357,6 +394,8 @@ class NaiveExperienceMaker(ABC):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            "token_counter": sum(samples.token_counters)/len(samples.token_counters),
+            "call_counter": sum(samples.call_counters)/len(samples.call_counters),
         }
         # reset model state
         self.actor.train()
@@ -534,9 +573,11 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             return self._mcts_vllm(all_prompts, all_solutions, **generate_kwargs)
         else:
             return self._generate_vllm(all_prompts, **generate_kwargs)
+    
     @torch.no_grad()
     def make_experience_prm(self, samples: Samples) -> Experience:
         km_token = 'ки'
+        sep_token = '\n'
         km_token_id1 = 12902
         km_token_id2 = 1107
         good_token_id = 648
@@ -559,6 +600,94 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             attention_mask.to("cpu"),
         )
 
+        # rewards
+        # 根据packed_seq_lens 分割成多段，进行decode
+        sequences_split = []
+        offset = 0
+        tokens_list = sequences_cpu.tolist()[0]
+        for length in packed_seq_lens:
+            # 去掉eottoken
+            sequences_split.append(tokens_list[offset : offset + length-1])
+            offset += length
+        decoded_sequences = self.tokenizer.batch_decode(sequences_split, skip_special_tokens=False)
+        # ------------------------------prm 处理------------------------------
+        # split_actor_p_responses = [resp.split(sep_token) for resp in decoded_sequences]
+        # # 给每个response加上sep_token，过滤掉空字符串
+        # # 去掉原来里面存在的km token
+        # split_actor_p_responses = [[resp.replace(km_token, '')+sep_token for resp in split_resp if resp.strip()] for split_resp in split_actor_p_responses]
+        # for split_resp in split_actor_p_responses:
+        #     # 去掉最后一个换行符\n
+        #     split_resp[-1] = split_resp[-1][:-1]
+        
+        # # TODO: 检查下有没有填充
+        # split_actor_seqs = [[self.tokenize_fn(resp, self.prompt_max_len, device='cuda') for resp in split_resp] for split_resp in split_actor_p_responses]
+        # # 元素为torch.tensor, (1, len)
+        # split_actor_seqs = [[item['input_ids'][0] for item in split_seq] for split_seq in split_actor_seqs ]
+        # # 用于确定每个step的reward位置
+        # split_actor_lens = [[len(seq) for seq in split_seq] for split_seq in split_actor_seqs]
+        # concatenated_actor_seqs = []
+        # for split_actor_seq in split_actor_seqs:
+        #     # 展平二维列表
+        #     flat_list = [item for sublist in split_actor_seq for item in sublist]
+        #     concatenated_actor_seqs.append(flat_list)
+        # packed_seq_lens = [len(seq) for seq in concatenated_actor_seqs]
+        # sequences = []
+        # attention_mask = []
+        # for i, seq in enumerate(concatenated_actor_seqs):
+        #     sequences.extend(seq)
+        #     attention_mask.extend([1]*len(seq))
+        
+        # sequences = torch.tensor(sequences, device="cuda").unsqueeze(0)
+        # attention_mask = torch.tensor(attention_mask, device="cuda").unsqueeze(0)
+        # sequences_cpu = sequences.to("cpu")
+        # attention_mask_cpu = attention_mask.to("cpu")
+
+        # # fix bug, 至少有一个，不然backward会没有更新报错
+        # km_join_p_responses = [km_token.join(split_resp)+km_token for split_resp in split_actor_p_responses]
+        # reward_encoded_inputs = self.tokenize_fn(km_join_p_responses, self.prompt_max_len*10, device='cuda', tokenizer=self.critic_tokenizer, padding=False)
+        # step_rewards_ref = self.reward_model[0].get_prm.remote(reward_encoded_inputs)
+        # step_rewards = ray.get(step_rewards_ref)
+        # # step_rewards = self.get_step_rewards_ray(km_join_p_responses)
+        # # 转成二维
+        # step_rewards_2d = []
+        # rewards = torch.zeros_like(sequences, device='cuda', dtype=torch.bfloat16)
+        # start = 0
+        # step_i = 0
+        # for one_split_lens in split_actor_lens:
+        #     step_reward = []
+        #     for split_len in one_split_lens:
+        #         idx = start + split_len - 1
+        #         step_reward.append(step_rewards[step_i])
+        #         rewards[0, idx] = step_rewards[step_i]
+        #         start += split_len
+        #         step_i += 1
+        #     step_rewards_2d.append(step_reward)
+        # # 如果len(reward)!=0，否则avg=0
+        # avg_step_rewards = []
+        # for reward in step_rewards_2d:
+        #     if len(reward):
+        #         avg_step_rewards.append(sum(reward)/len(reward))
+        #     else:
+        #         avg_step_rewards.append(0)
+        rm_res_ref = self.reward_model[0].get_prm_res.remote(decoded_sequences, return_seqs_and_masks=True)
+        rm_res = ray.get(rm_res_ref)
+        packed_seq_lens = rm_res['packed_seq_lens']
+        sequences = rm_res['sequences']
+        attention_mask = rm_res['attention_mask']
+        sequences_cpu, attention_mask_cpu = sequences.to("cpu"), attention_mask.to("cpu")
+        rewards = rm_res['rewards']
+
+        # ------------------------------prm 处理------------------------------
+        seq_nums = len(packed_seq_lens)
+        input_len = int((samples.total_length[0] - samples.response_length[0]).tolist())
+        for i in range(seq_nums):
+            output_len = packed_seq_lens[i]-input_len
+            num_actions[i] = output_len
+            samples.response_length[i] = output_len
+            samples.total_length[i] = input_len + output_len
+
+        # log probs
+        action_log_probs = self.actor(sequences, num_actions, attention_mask, packed_seq_lens=packed_seq_lens)
         # init log probs
         base_action_log_probs_ref = self.initial_model.forward.remote(
             sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
@@ -575,93 +704,21 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 ray.get([self.critic.empty_cache.remote()])
         else:
             value_ref = ray.put(None)
-
         if self.strategy.args.colocate_actor_ref:
             ray.get([base_action_log_probs_ref])
             ray.get([self.initial_model.empty_cache.remote()])
-
-        # rewards
-        # 根据packed_seq_lens 分割成多段，进行decode
-        sequences_split = []
-        offset = 0
-        tokens_list = sequences_cpu.tolist()[0]
-        for length in packed_seq_lens:
-            # 去掉eottoken
-            sequences_split.append(tokens_list[offset : offset + length-1])
-            offset += length
-        decoded_sequences = self.tokenizer.batch_decode(sequences_split, skip_special_tokens=False)
-        # decoded_sequences = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
-        decoded_sequences = [seq.replace(km_token, ' ') + km_token for seq in decoded_sequences]
-        critic_inputs = self.tokenize_fn(decoded_sequences, self.prompt_max_len*10, device='cuda', tokenizer=self.critic_tokenizer, padding=False)
-        critic_encoded_sequences = critic_inputs['input_ids']
-        critic_attention_mask = critic_inputs['attention_mask']
-        critic_packed_seq_lens = []
-        # sequences 是二维的，获取每行长度，作为critic_packed_seq_lens
-        for seq in critic_encoded_sequences:
-            critic_packed_seq_lens.append(len(seq))
-        # 展平critic_encoded_sequences, critic_encoded_mask为一维
-        _critic_encoded_sequences = []
-        for seq in critic_encoded_sequences:
-            _critic_encoded_sequences.extend(seq)
-        critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
-        _critic_attention_mask = []
-        for mask in critic_attention_mask:
-            _critic_attention_mask.extend(mask)
-        critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
-        r_refs = []
-        # support remote RM API with ray
-        if not self.remote_rm_url:
-            for rm in self.reward_model:
-                r_refs.append(rm.forward.remote(critic_encoded_sequences, critic_attention_mask, packed_seq_lens=critic_packed_seq_lens))
-        else:
-            # remote RM
-            for rm in self.remote_rm_url:
-                if not self.packing_samples:
-                    queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
-                    r = remote_rm_fn_ray.remote(rm, queries=queries)
-                    r_refs.append(r)
-                else:
-                    sequences_list = []
-                    offset = 0
-                    tokens_list = sequences_cpu.tolist()[0]
-                    for length in packed_seq_lens:
-                        sequences_list.append(tokens_list[offset : offset + length])
-                        offset += length
-                    queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
-                    r = remote_rm_fn_ray.remote(rm, queries=queries)
-                    r_refs.append(r)
-
-        # log probs
-        action_log_probs = self.actor(sequences, num_actions, attention_mask, packed_seq_lens=packed_seq_lens)
         actor_value_rm_time = time.time() - start
 
         # wait initial/critic/reward model done
         start = time.time()
-        ref_values = ray.get([base_action_log_probs_ref, value_ref] + r_refs)
+        ref_values = ray.get([base_action_log_probs_ref, value_ref])
         wait_time = time.time() - start
-        base_action_log_probs, value, rewards = ref_values[0], ref_values[1], ref_values[2:]
-        def process_reward(reward):
-            # reward: (batch_size, seq_len, vocab_size)
-            reward = reward[..., candidate_tokens]
-            reward = reward.softmax(dim=-1)[...,0]
-            reward = reward[:, -1]
-            # step_rewards = [score[(reward_encoded_sequences[i]==km_token_id1) | (reward_encoded_sequences[i]==km_token_id2)] for i, score in enumerate(reward_scores)]
-            reward = reward*2-1
-            return reward
-        _rewards = []
-        for reward in rewards:
-            _reward = []
-            offset = 0
-            for i in range(len(critic_packed_seq_lens)):
-                _reward.append(process_reward(reward[:,offset:offset+critic_packed_seq_lens[i]]))
-                offset += critic_packed_seq_lens[i]
-            _rewards.append(torch.tensor(_reward, dtype=torch.bfloat16))
-        rewards = _rewards
+        base_action_log_probs, value = ref_values[0], ref_values[1]
         base_action_log_probs = base_action_log_probs.to(device)
         if value is not None:
             value = value.to(device)
-        rewards = [r.to(device) for r in rewards]
-        r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
+        # rewards = [r.to(device) for r in rewards]
+        # r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
 
         # avoid CUDA OOM when colocate models
         if self.strategy.args.colocate_critic_reward and not self.remote_rm_url:
@@ -670,9 +727,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if self.strategy.args.colocate_actor_ref:
             torch.cuda.empty_cache()
         
-        # if self.advantage_estimator == 'group_norm':
-        #     kl = None
-        # else:
         kl = compute_approx_kl(
             action_log_probs,
             base_action_log_probs,
@@ -686,6 +740,13 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             # convert tensor into list of tensors so that it's easier to manipulate
             # within dataset.
             sequences = unpacking_samples(sequences, packed_seq_lens)
+            rewards = unpacking_samples(rewards, packed_seq_lens)
+            # num_actions 还得更新
+            for i, num_action in enumerate(num_actions):
+                rewards[i] = rewards[i][-num_action:]
+
+            # (bacch_size, max_seq_len) 在末尾补0
+            # rewards = pad_sequence(rewards, batch_first=True, padding_value=0.0)
             attention_mask = None
             action_log_probs = unpacking_samples(action_log_probs, num_actions)
             if value is not None:
@@ -695,10 +756,12 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=device) if kl is not None else None
         info = {
             # "kl": kl_mean,
-            "reward": r,
+            "reward": rewards,
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            "token_counter": torch.tensor(samples.token_counters, dtype=torch.float32),
+            "call_counter": torch.tensor(samples.call_counters, dtype=torch.float32),
         }
         if kl is not None:
             info['kl'] = kl_mean
@@ -821,6 +884,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            "token_counter": sum(samples.token_counters)/len(samples.token_counters),
+            "call_counter": sum(samples.call_counters)/len(samples.call_counters),
         }
         if kl is not None:
             info['kl'] = kl_mean
@@ -1038,6 +1103,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
+            "token_counter": sum(samples.token_counters)/len(samples.token_counters),
+            "call_counter": sum(samples.call_counters)/len(samples.call_counters),
         }
         if kl is not None:
             info['kl'] = kl_mean
@@ -1314,9 +1381,13 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 packed_seq_lens = []
                 attention_mask = []
                 num_actions = []
+                token_counters = []
+                call_counters = []
                 for i, output in enumerate(outputs):
                     input_len = len(output.prompt_token_ids)
                     output_len = len(output.outputs[0].token_ids)
+                    token_counters.append(output_len)
+                    call_counters.append(1)
                     packed_seq_lens.append(input_len + output_len)
                     sequences.extend(output.prompt_token_ids + list(output.outputs[0].token_ids))
                     attention_mask.extend([i + 1] * (input_len + output_len))
@@ -1339,6 +1410,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         packed_seq_lens=packed_seq_lens,
                         response_length=response_length,
                         total_length=total_length,
+                        token_counters=token_counters,
+                        call_counters=call_counters
                     )
                 )
         return samples_list
@@ -1372,8 +1445,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # list[list[str]:num_rollouts]
         all_model_solutions = []
         all_node_solutions = []
-
+        all_token_counter = []
+        all_call_counter = []
+        breakpoint()
         for user_question, gt_solution in zip(all_prompts, all_gt_solutions):
+            # 计数器归零
+            self.generator.io.call_counter = 0
+            self.generator.io.token_counter = 0
+
             gt_answer = self.evaluator.extract_answer_from_gold_solution(gt_solution)
             #! build an MCTS searcher
             mcts_searcher = MCTS_Searcher(
@@ -1419,6 +1498,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             model_all_solutions = []
             model_rollout_nodes = []
             for i in (pbar := trange(args.num_rollouts, disable=True, position=0)):
+                breakpoint()
                 rollout_node = mcts_searcher.do_rollout(root_node, i)
                 model_rollout_nodes.append(rollout_node)
                 _, best_solution, _, chosen_node, all_solution_nodes, all_solutions = stochastic_find_best_solution(
@@ -1449,19 +1529,24 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             model_solutions.append(best_solution)
             solution_nodes.append(chosen_node)
             js = [{"trace": node.solution_trace, "rollout_id": node.rollout_id} for node in all_solution_nodes]
-            with open(os.path.join(args.answer_sheets_dir, f"Question {user_question[:20]} - Final Solutions.json"), "w") as f:
+            with open(os.path.join(args.answer_sheets_dir, "Question "+re.sub(r'[^a-zA-Z0-9+\-$()\[\]]', '_', user_question[:25])+" - Final Solutions.json"), "w") as f:
                 json.dump(js, f)
 
             js2 = [{"trace": node.solution_trace, "rollout_id": i} for i, node in enumerate(model_rollout_nodes)]
-            with open(os.path.join(args.answer_sheets_dir, f"Question {user_question[:20]} - Rollout Solutions.json"), "w") as f:
+            with open(os.path.join(args.answer_sheets_dir, "Question "+re.sub(r'[^a-zA-Z0-9+\-$()\[\]]', '_', user_question[:25])+" - Rollout Solutions.json"), "w") as f:
                 json.dump(js2, f)
 
             all_model_solutions.append(model_solutions)
             all_node_solutions.append(solution_nodes)
+            all_token_counter.append(self.generator.io.token_counter)
+            all_call_counter.append(self.generator.io.call_counter)
 
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             model_solutions = all_model_solutions[i:i+args.micro_rollout_batch_size]
             node_solutions = all_node_solutions[i:i+args.micro_rollout_batch_size]
+            token_counters = all_token_counter[i:i+args.micro_rollout_batch_size]
+            call_counters = all_call_counter[i:i+args.micro_rollout_batch_size]
+
             _model_solutions = []
             solution_rewards = []
             for i, solutions in enumerate(model_solutions):
@@ -1511,7 +1596,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                         packed_seq_lens=packed_seq_lens,
                         response_length=response_length,
                         total_length=total_length,
-                        rewards=solution_rewards
+                        rewards=solution_rewards,
+                        call_counters=call_counters,
+                        token_counters=token_counters,
                     )
                 )
         return samples_list
