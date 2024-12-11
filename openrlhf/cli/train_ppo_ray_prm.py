@@ -1,24 +1,12 @@
-# Licensed under the MIT license.
-
-import sys
-import os, json, time
-from tqdm import tqdm
-import math
-sys.path.append(".")
-
-
-from mcts.common.utils import fix_seeds, setup_model_parallel, read_json
-from mcts.common.arguments import get_parser, post_process_args, save_args
-from mcts.run_src.mcts_only_ost_reasoning import Generator, search_for_answers
-from mcts.eval_src.Evaluator import *
 import argparse
 from datetime import datetime
 from typing import List
-import sys
+import os
+
 import ray
 import torch
 from ray.util.placement_group import placement_group
-from tests.test_utils import VllmGenerator
+from mcts.common.arguments import get_parser, post_process_args, save_args
 
 from openrlhf.trainer.ray import (
     ActorModelRayActor,
@@ -29,135 +17,170 @@ from openrlhf.trainer.ray import (
     create_vllm_engines,
 )
 from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
-#保证host和端口一致，listen可以只设置端口。则为localhost,否则设置成(host,port)
-# debugpy.listen(12361)
-# print('wait debugger')
-# debugpy.wait_for_client()
-# print("Debugger Attached")
 
 
-def main(args):
-    fix_seeds(args.seed)
-    args.model_ckpt = args.pretrain
-    if args.model_parallel:
-        args.local_rank, args.world_size = setup_model_parallel()
+# NOTE: reward function for multiple reward models, replace this with your own function!
+def reward_fn(rewards: List[torch.Tensor]):
+    return torch.stack(rewards).sum(dim=0)
+
+
+def _validate_args(args):
+    actor_world_size = args.actor_num_nodes * args.actor_num_gpus_per_node
+
+    assert (
+        actor_world_size & (actor_world_size - 1)
+    ) == 0, f"actor_world_size must be power of 2, got {actor_world_size}"
+
+    if args.critic_pretrain:
+        critic_world_size = args.critic_num_nodes * args.critic_num_gpus_per_node
+        assert (
+            critic_world_size & (critic_world_size - 1)
+        ) == 0, f"critic_world_size must be power of 2, got {critic_world_size}"
+        assert (
+            actor_world_size % critic_world_size == 0
+        ), f"actor_world_size must be divisible by critic_world_size, got {actor_world_size} and {critic_world_size}"
+
+    assert args.zero_stage != 3 or args.vllm_num_engines > 0, f"ZeRO-3 is only supported when vLLM enabled"
+
+
+def train(args):
+    if args.advantage_estimator == "gae":
+        use_critic = True
+    elif args.advantage_estimator == "group_norm":
+        use_critic = False
+        assert args.n_samples_per_prompt > 1, "The number of samples under each prompt must be greater than 1"
+    elif args.advantage_estimator == 'reinforce':
+        pass
     else:
-        args.local_rank, args.world_size = 0, 1
+        raise NotImplementedError(f"Advantage estimator {args.advantage_estimator} is not implemented.")
 
+    _validate_args(args)
+    # configure strategy
     strategy = get_strategy(args)
 
-    # ----------vllm init-------------
-    # class Obs:
-    #     def __init__(self, **kwargs):
-    #         for k, v in kwargs.items():
-    #             setattr(self, k, v)
-    # obs = Obs(
-    #     config=Obs(
-    #         pad_token_id=0,
-    #     )       
-    # )
-    # tokenizer = get_tokenizer(
-    #     args.pretrain, obs, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
-    # )
+    # if colocated, create placement group for actor and ref model explicitly.
+    pg = None
+    if args.colocate_actor_ref:
+        assert (
+            args.actor_num_nodes == args.ref_num_nodes and args.actor_num_gpus_per_node == args.ref_num_gpus_per_node
+        ), f"num_nodes and num_gpus_per_node must be the same when colocate actor and ref model."
+
+        bundles = [
+            {"GPU": args.actor_num_gpus_per_node, "CPU": args.actor_num_gpus_per_node}
+            for _ in range(args.actor_num_nodes)
+        ]
+        pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(pg.ready())
+
+    # NOTE(wuxibin): Why don't we allocate 0.5 gpu for each actor when colocate models?
+    # Say we have 1 node with 4 GPUs, and num_gpus_per_node for each model is 4.
+    # If we allocate 0.5 gpu for both actor and ref model, then gpu allocation is
+    #   |actor|actor|actor|actor|  ref | ref  | ref  | ref |
+    #   |GPU0 |GPU0 |GPU1 |GPU1 | GPU2 | GPU2 | GPU3 | GPU3 |
+    #
+    # So 0.75/0.25 gpu is a tricky to let Ray spread all models evenly on all gpus.
+    #   |actor| ref  |actor| ref  |actor| ref  |actor|ref  |
+    #   |GPU0 | GPU0 |GPU1 | GPU1 |GPU2 | GPU2 |GPU3 | GPU3 |
+    actor_model = PPORayActorGroup(
+        args.actor_num_nodes,
+        args.actor_num_gpus_per_node,
+        ActorModelRayActor,
+        pg=pg,
+        num_gpus_per_actor=0.75 if pg else 1,
+    )
+
+    ref_model = PPORayActorGroup(
+        args.ref_num_nodes,
+        args.ref_num_gpus_per_node,
+        ReferenceModelRayActor,
+        pg=pg,
+        num_gpus_per_actor=0.25 if pg else 1,
+    )
+
+    # if colocated, create placement group for critic and reward model explicitly.
+    pg = None
+    if args.critic_pretrain and args.colocate_critic_reward:
+        assert (
+            args.critic_num_nodes == args.reward_num_nodes
+            and args.critic_num_gpus_per_node == args.reward_num_gpus_per_node
+        ), f"num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
+
+        bundles = [
+            {"GPU": args.critic_num_gpus_per_node, "CPU": args.critic_num_gpus_per_node}
+            for _ in range(args.critic_num_nodes)
+        ]
+        pg = placement_group(bundles, strategy="STRICT_SPREAD")
+        ray.get(pg.ready())
+
+    if args.critic_pretrain:
+        critic_model = PPORayActorGroup(
+            args.critic_num_nodes,
+            args.critic_num_gpus_per_node,
+            CriticModelRayActor,
+            pg=pg,
+            num_gpus_per_actor=0.75 if pg else 1,
+        )
+    else:
+        critic_model = None
+
+    # multiple reward models
+    if not args.remote_rm_url:
+        reward_pretrains = args.reward_pretrain.split(",")
+        reward_models = []
+        for _ in reward_pretrains:
+            reward_models.append(
+                PPORayActorGroup(
+                    args.reward_num_nodes,
+                    args.reward_num_gpus_per_node,
+                    RewardModelRayActor,
+                    pg=pg,
+                    num_gpus_per_actor=0.25 if pg else 1,
+                )
+            )
+    else:
+        reward_models = None
+
+    # init reference/reward/actor model
+    refs = []
+    refs.extend(ref_model.async_init_model_from_pretrained(strategy, args.pretrain))
+    refs.extend(actor_model.async_init_model_from_pretrained(strategy, args.pretrain))
+    if not args.remote_rm_url:
+        for reward_model, reward_pretrain in zip(reward_models, reward_pretrains):
+            refs.extend(reward_model.async_init_model_from_pretrained(strategy, reward_pretrain))
+
+    ray.get(refs)
+
+    # init vLLM engine for text generation
     vllm_engines = None
     if args.vllm_num_engines is not None and args.vllm_num_engines > 0:
         max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
         vllm_engines = create_vllm_engines(
             args.vllm_num_engines,
             args.vllm_tensor_parallel_size,
-            # args.pretrain,
-            args.model_ckpt,
+            args.pretrain,
             args.seed,
             args.enable_prefix_caching,
             args.enforce_eager,
             max_len,
         )
-    
-    vllm_generator = VllmGenerator(
-        strategy, 
-        vllm_engines
+
+    if args.critic_pretrain:
+        # critic scheduler initialization depends on max_step, so we have to init critic after actor
+        # TODO: use first reward model as critic model
+        max_steps = ray.get(actor_model._actor_handlers[0].max_steps.remote())
+        refs.extend(critic_model.async_init_model_from_pretrained(strategy, args.critic_pretrain, max_steps))
+        ray.get(refs)
+    # train actor and critic mdoel
+    refs = actor_model.async_fit_actor_model(
+        critic_model, ref_model, reward_models, args.remote_rm_url, reward_fn=reward_fn, vllm_engines=vllm_engines
     )
-    # refs = [
-    vllm_generator.initialize_vllm_engines()
-    # ]
-    # ray.get(refs)
-    # ----------vllm init-------------
-    
-    test_file = os.path.join(args.data_root, args.dataset_name, args.test_json_filename + ".json")
-    assert os.path.exists(test_file), f"Test file {test_file} does not exist."
-    data_item_list = read_json(test_file)
+    ray.get(refs)
 
-    evaluator = eval(f"{args.dataset_name}Evaluator()")
+    # save model
+    ray.get(actor_model.async_save_model())
 
-    model, tokenizer = None, None
-    generator = Generator(args, tokenizer, model, evaluator, vllm_generator)
-
-    total_correct = 0
-    total_correct_limit = 0
-    num_tested = 0
-    start_time = time.time()
-
-    for i, data_item in enumerate(
-        (pbar := tqdm(data_item_list, disable=args.local_rank > 0 or args.verbose, position=1))
-    ):
-        if i < args.start_idx or i >= args.end_idx:
-            continue
-
-        problem_id, problem, gt_solution = data_item["id"], data_item["problem"], data_item["solution"]
-        gt_answer = evaluator.extract_answer_from_gold_solution(gt_solution)
-
-        js = {
-            "id": problem_id,
-            "problem": problem,
-            "model_completion": None,
-            "model_answer": None,
-            "all_model_completions": {},
-            "gold_solution": gt_solution,
-            "gold_answer": gt_answer,
-        }
-
-        model_solutions, stopping_id, model_all_solutions = [], -1, []
-
-        # try:
-        model_solutions, stopping_id, model_all_solutions = search_for_answers(
-            args=args, user_question=problem, question_id=i, gt_answer=gt_solution, generator=generator
-        )
-        # except GeneratorError as e:
-        #     print(e)
-        #     js["generator_error"] = {
-        #         "source": e.source,
-        #         "io_input": e.io_input,
-        #         "io_output_list": e.io_output_list,
-        #     }
-        # except Exception as e:
-        #     print(e)
-        #     js["other_error"] = {"text": str(e)}
-
-        num_tested += 1
-
-        with open(os.path.join(args.answer_sheets_dir, f"Question {i:04d} - Answer.json"), "w") as f:
-            json.dump(js, f)
-
-        with open(os.path.join(args.run_outputs_dir, "intermediate_result.txt"), "w") as f:
-            f.write(
-                f"Total calls: {generator.io.call_counter}, Avg calls: {generator.io.call_counter/(num_tested):.2f}\n"
-            )
-            f.write(
-                f"Total tokens: {generator.io.token_counter}, Avg tokens: {generator.io.token_counter/(num_tested):.2f}\n"
-            )
-
-    end_time = time.time()
-
-    print(f"==> Total calls: {generator.io.call_counter}, Avg calls: {generator.io.call_counter/(num_tested):.2f}")
-    print(f"==> Total tokens: {generator.io.token_counter}, Avg tokens: {generator.io.token_counter/(num_tested):.2f}")
-    print(f"==> Total time: {end_time-start_time:.2f}s, Avg time: {(end_time-start_time)/(num_tested):.2f}s")
-
-    with open(os.path.join(args.run_outputs_dir, "final_result.txt"), "w") as f:
-        f.write(f"Total calls: {generator.io.call_counter}, Avg calls: {generator.io.call_counter/(num_tested):.2f}\n")
-        f.write(
-            f"Total tokens: {generator.io.token_counter}, Avg tokens: {generator.io.token_counter/(num_tested):.2f}\n"
-        )
-        f.write(f"Total time: {end_time-start_time:.2f}s, Avg time: {(end_time-start_time)/(num_tested):.2f}s\n")
+    if args.critic_pretrain and args.save_value_network:
+        ray.get(critic_model.async_save_model())
 
 
 if __name__ == "__main__":
@@ -177,6 +200,8 @@ if __name__ == "__main__":
     parser.add_argument("--mcts_weight_scheduler", choices=["exp", "lin", "const"], default="const")
     parser.add_argument("--mcts_num_last_votes", type=int, default=None)
     parser.add_argument("--save_tree", action="store_true")
+    parser.add_argument('--mcts_mode', default='', choices=['only_ost', 'full_actions'], help='Use MCTS sampling')
+    parser.add_argument('--mcts_use_prm', default=False, action='store_true', help='mcts intermediate backpropogate')
 
     # Action1: Propose an one-step thought.
     parser.add_argument("--num_a1_steps", type=int, default=None)
@@ -310,6 +335,10 @@ if __name__ == "__main__":
     parser.add_argument("--adam_betas", type=float, nargs=2, default=(0.9, 0.95), help="Betas for Adam optimizer")
     parser.add_argument("--reward_clip_range", type=float, nargs=2, default=(-10, 10), help="Reward clip range")
 
+    # train method
+    # sample method
+    # parser.add_argument("--sample_method", type=str, default="mcts", help="sample method: mcts, random")
+
     # Reinforce
     parser.add_argument(
         "--advantage_estimator",
@@ -348,6 +377,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_split", type=str, default="train")
 
     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")
+    parser.add_argument("--solution_key", type=str, default="solution", help="JSON dataset key")
     parser.add_argument("--input_template", type=str, default=None)
     parser.add_argument(
         "--apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
@@ -370,7 +400,7 @@ if __name__ == "__main__":
 
     # performance tuning
     parser.add_argument("--perf", action="store_true", default=False)
-
+    
     args = parser.parse_args()
 
     if args.advantage_estimator not in ["gae"]:
@@ -442,5 +472,5 @@ if __name__ == "__main__":
 
     args = post_process_args(args)
     print(args)
-    save_args(args)
-    main(args)
+    # save_args(args)
+    train(args)

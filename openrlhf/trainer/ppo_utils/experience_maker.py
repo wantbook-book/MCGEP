@@ -523,18 +523,32 @@ class NaiveExperienceMaker(ABC):
 
 
 class RemoteExperienceMaker(NaiveExperienceMaker):
-    def __init__(self, *args, vllm_generator, evaluator, vllm_engines: List = None, packing_samples=False, use_prm=False, **kwargs):
+    def __init__(self, *args, vllm_generator, evaluator, vllm_engines: List = None, packing_samples=False, use_prm=False, mcts_use_prm=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.vllm_engines = vllm_engines
         self.packing_samples = packing_samples
+        # 用于非mcts情况下，用orm还是prm
         self.use_prm = use_prm
+        # 用于mcts情况下，如果有prm可以使节点从中间返回
+        self.mcts_use_prm = mcts_use_prm
         model, tokenizer = None, None
         args = self.strategy.args
         self.vllm_generator = vllm_generator
         if args.mcts_mode:
             if args.mcts_mode == 'only_ost':
                 # TODO: shi
-                self.generator = OstOrAnswerGenerator(args, tokenizer, model, evaluator, vllm_generator, self)
+                self.generator = OstOrAnswerGenerator(
+                    args, 
+                    tokenizer, 
+                    model, 
+                    evaluator, 
+                    vllm_generator, 
+                    self.reward_model[0], 
+                    mcts_use_prm=self.mcts_use_prm,
+                    enable_go_explore=args.enable_go_explore,
+                    multi_step_one_node=args.multi_step_one_node,
+                    correct_step_thres=args.correct_step_thres
+                )
             elif args.mcts_mode == 'full_actions':
                 self.generator = MCTSGenerator(args, tokenizer, model, evaluator, vllm_generator)
         else:
@@ -785,6 +799,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experience
     
     def make_experience_mcts(self, samples: Samples) -> Experience:
+        breakpoint()
         km_token = 'ки'
         km_token_id1 = 12902
         km_token_id2 = 1107
@@ -884,8 +899,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
-            "token_counter": sum(samples.token_counters)/len(samples.token_counters),
-            "call_counter": sum(samples.call_counters)/len(samples.call_counters),
+            "token_counter": torch.tensor(samples.token_counters, dtype=torch.float32),
+            "call_counter": torch.tensor(samples.call_counters, dtype=torch.float32),
         }
         if kl is not None:
             info['kl'] = kl_mean
@@ -930,8 +945,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             _critic_encoded_sequences.extend(seq)
         critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
         _critic_attention_mask = []
-        for mask in critic_attention_mask:
-            _critic_attention_mask.extend(mask)
+        for i, mask in enumerate(critic_attention_mask):
+            breakpoint()
+            _critic_attention_mask.extend(mask*(i+1))
         critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
         r_ref = self.reward_model[0].forward.remote(critic_encoded_sequences, critic_attention_mask, packed_seq_lens=critic_packed_seq_lens)
         rewards = ray.get(r_ref)
@@ -1025,8 +1041,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             _critic_encoded_sequences.extend(seq)
         critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
         _critic_attention_mask = []
-        for mask in critic_attention_mask:
-            _critic_attention_mask.extend(mask)
+        # TODO: 不太对, 确认一下
+        for i, mask in enumerate(critic_attention_mask):
+            breakpoint()
+            _critic_attention_mask.extend(mask*(i+1))
         critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
         r_refs = []
         # support remote RM API with ray
@@ -1447,7 +1465,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         all_node_solutions = []
         all_token_counter = []
         all_call_counter = []
-        breakpoint()
         for user_question, gt_solution in zip(all_prompts, all_gt_solutions):
             # 计数器归零
             self.generator.io.call_counter = 0
@@ -1461,6 +1478,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 num_rollouts=args.num_rollouts,
                 discount=args.mcts_discount_factor,
                 verbose=args.verbose,
+                mcts_use_prm=args.mcts_use_prm
             )
 
             #! build the MCTS tree
@@ -1498,7 +1516,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             model_all_solutions = []
             model_rollout_nodes = []
             for i in (pbar := trange(args.num_rollouts, disable=True, position=0)):
-                breakpoint()
                 rollout_node = mcts_searcher.do_rollout(root_node, i)
                 model_rollout_nodes.append(rollout_node)
                 _, best_solution, _, chosen_node, all_solution_nodes, all_solutions = stochastic_find_best_solution(
@@ -1540,7 +1557,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             all_node_solutions.append(solution_nodes)
             all_token_counter.append(self.generator.io.token_counter)
             all_call_counter.append(self.generator.io.call_counter)
-
+        breakpoint()
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             model_solutions = all_model_solutions[i:i+args.micro_rollout_batch_size]
             node_solutions = all_node_solutions[i:i+args.micro_rollout_batch_size]

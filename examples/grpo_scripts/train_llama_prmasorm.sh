@@ -1,9 +1,9 @@
 set -x 
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
 wandb_token=b0255391060d68833e9b98941b9eb94fe770fbe4
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{"working_dir": "/pubshare/fwk/code/MCGEP"}' \
-   -- python3 -m openrlhf.cli.train_ppo_prm_ray \
+   -- python3 -m openrlhf.cli.train_ppo_ray_prmasorm \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 1 \
    --reward_num_nodes 1 \

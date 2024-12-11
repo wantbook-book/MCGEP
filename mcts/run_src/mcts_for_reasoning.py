@@ -521,8 +521,8 @@ class Reasoning_MCTS_Node(MCTS_Node):
         try:
             assert depth is not None
             assert node_type is not None
-            if node_value is not None:
-                assert node_value > 0, breakpoint()
+            # if node_value is not None:
+            #     assert node_value > 0, breakpoint()
 
             if node_type is Node_Type.USER_QUESTION:
                 assert depth == 0

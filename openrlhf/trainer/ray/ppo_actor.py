@@ -65,7 +65,8 @@ class ActorPPOTrainer(PPOTrainer):
             critic_tokenizer=kwargs['critic_tokenizer'],
             use_prm=self.strategy.args.use_prm,
             vllm_generator=self.vllm_generator,
-            evaluator=self.evaluator
+            evaluator=self.evaluator,
+            mcts_use_prm=self.strategy.args.mcts_use_prm
         )
 
         # Create torch group with deepspeed rank 0 and all vllm ranks
@@ -425,7 +426,6 @@ class ActorModelRayActor(BasePPORole):
         """Train actor model with prompt datasets."""
         strategy = self.strategy
         args = self.strategy.args
-
         # configure Trainer
         trainer = ActorPPOTrainer(
             strategy,

@@ -217,7 +217,8 @@ def _get_reward_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 reward = (reward - self.mean) / self.std
 
             return (reward, outputs) if return_output else reward
-
+        
+        
     return RewardModel
 
 

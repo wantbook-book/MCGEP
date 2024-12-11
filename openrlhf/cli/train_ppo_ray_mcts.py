@@ -1,10 +1,12 @@
 import argparse
 from datetime import datetime
 from typing import List
+import os
 
 import ray
 import torch
 from ray.util.placement_group import placement_group
+from mcts.common.arguments import get_parser, post_process_args, save_args
 
 from openrlhf.trainer.ray import (
     ActorModelRayActor,
@@ -42,6 +44,8 @@ def _validate_args(args):
 
 
 def train(args):
+    assert not args.use_prm or args.use_prm and not args.mcts_mode, "now mcts not supports use_prm"
+
     if args.advantage_estimator == "gae":
         use_critic = True
     elif args.advantage_estimator == "group_norm":
@@ -182,7 +186,36 @@ def train(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    #! -------------------------------- Arguments --------------------------------
+    parser = get_parser()
+
+    parser.add_argument("--num_rollouts", type=int, default=15)
+    parser.add_argument(
+        "--num_subquestions", type=int, default=3, help="Number of trials for proposing the next subquestion"
+    )
+    parser.add_argument("--num_votes", type=int, default=10)
+    parser.add_argument("--max_depth_allowed", type=int, default=5)
+
+    # MCTS
+    parser.add_argument("--mcts_discount_factor", type=float, default=1.0)
+    parser.add_argument("--mcts_exploration_weight", type=float, default=2.0)
+    parser.add_argument("--mcts_weight_scheduler", choices=["exp", "lin", "const"], default="const")
+    parser.add_argument("--mcts_num_last_votes", type=int, default=None)
+    parser.add_argument("--save_tree", action="store_true")
+
+    # Action1: Propose an one-step thought.
+    parser.add_argument("--num_a1_steps", type=int, default=None)
+    parser.add_argument("--disable_a1", action="store_true")
+
+    # Paraphrasing
+    parser.add_argument("--modify_prompts_for_rephrasing", action="store_true")
+    parser.add_argument("--disable_a5", action="store_true")
+
+    #! -------------------------- Used for selecting answer --------------------------
+    parser.add_argument("--enable_potential_score", action="store_true")
+
+    #! -------------------------------------------------------------------------------
+
     # Ray and vLLM
     parser.add_argument("--ref_num_nodes", type=int, default=1, help="number of nodes for reference")
     parser.add_argument("--ref_num_gpus_per_node", type=int, default=8, help="number of gpus per node for reference")
@@ -277,9 +310,9 @@ if __name__ == "__main__":
     parser.add_argument("--micro_train_batch_size", type=int, default=4, help="batch size per GPU")
     parser.add_argument("--train_batch_size", type=int, default=128, help="Global training batch size")
     parser.add_argument("--normalize_reward", action="store_true", default=False, help="Enable Reward Normazation")
-    parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=42)
+    # parser.add_argument("--top_p", type=float, default=1.0)
+    # parser.add_argument("--temperature", type=float, default=1.0)
+    # parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--freezing_actor_steps", type=int, default=-1, help="Used for critic initialization")
     parser.add_argument(
         "--n_samples_per_prompt", type=int, default=1, help="number of responses for each prompt in generation"
@@ -364,16 +397,14 @@ if __name__ == "__main__":
     # performance tuning
     parser.add_argument("--perf", action="store_true", default=False)
 
+    # mcts
+    parser.add_argument('--mcts_mode', default='', choices=['only_ost', 'full_actions'], help='Use MCTS sampling')
+    parser.add_argument('--mcts_use_prm', default=False, action='store_true', help='mcts intermediate backpropogate')
+    parser.add_argument('--enable_go_explore', default=False, action='store_true', help='enable go explore')
+    parser.add_argument('--multi_step_one_node', default=False, action='store_true', help='multi steps one node')
+    parser.add_argument('--correct_step_thres', default=1.0, type=float, help='correct step threshold')
+    
 
-    allowed_dataset_names = ["MATH", "GSM8K", "GSM8KHARD", "STG", "SVAMP", "MULTIARITH"]
-    parser.add_argument(
-        "--dataset_name",
-        required=True,
-        choices=allowed_dataset_names,
-        help=f"Test dataset name: Choose from {allowed_dataset_names}.",
-    )
-
-    parser.add_argument('--mcts', action='store_true', default=False, help='Use MCTS sampling')
     args = parser.parse_args()
 
     if args.advantage_estimator not in ["gae"]:
@@ -406,4 +437,44 @@ if __name__ == "__main__":
         assert args.vllm_num_engines > 0, "Only support `--packing_samples` with vLLM."
         assert not args.pretrain_data, "`--pretrain_data` is not supported with `--packing_samples` yet."
 
+    if args.mcts_num_last_votes is None:
+        args.mcts_num_last_votes = 32
+
+    if not args.disable_a1:
+        if args.num_a1_steps is None:
+            args.num_a1_steps = 3
+
+    #! ----------------------------------------------------------------------------
+
+    prompts_dir = os.path.join(args.prompts_root, args.dataset_name)
+
+    args.fewshot_cot_prompt_path = os.path.join(prompts_dir, "fewshot_cot", "fewshot_cot_prompt.txt")
+    args.fewshot_cot_config_path = os.path.join(prompts_dir, "fewshot_cot", "fewshot_cot_config.json")
+
+    args.fewshot_ost_prompt_path = os.path.join(prompts_dir, "fewshot_ost", "fewshot_ost_prompt.txt")
+    args.fewshot_ost_config_path = os.path.join(prompts_dir, "fewshot_ost", "fewshot_ost_config.json")
+
+    args.decompose_template_path = os.path.join(prompts_dir, "decompose", "decompose_template.json")
+    args.decompose_prompt_path = os.path.join(prompts_dir, "decompose", "decompose_prompt.txt")
+
+    if not args.disable_a5:
+        args.rephrasing_prompt_template_path = os.path.join(prompts_dir, "rephrasing_prompt_template.txt")
+        if args.modify_prompts_for_rephrasing:
+            args.fewshot_cot_prompt_rephrased_path = os.path.join(
+                prompts_dir, "fewshot_cot", "fewshot_cot_prompt_rephrased.txt"
+            )
+            args.fewshot_ost_prompt_rephrased_path = os.path.join(
+                prompts_dir, "fewshot_ost", "fewshot_ost_prompt_rephrased.txt"
+            )
+            args.decompose_prompt_rephrased_path = os.path.join(
+                prompts_dir, "decompose", "decompose_prompt_rephrased.txt"
+            )
+        else:
+            args.fewshot_cot_prompt_rephrased_path = os.path.join(prompts_dir, "fewshot_cot", "fewshot_cot_prompt.txt")
+            args.fewshot_ost_prompt_rephrased_path = os.path.join(prompts_dir, "fewshot_ost", "fewshot_ost_prompt.txt")
+            args.decompose_prompt_rephrased_path = os.path.join(prompts_dir, "decompose", "decompose_prompt.txt")
+
+    args = post_process_args(args)
+    print(args)
+    # save_args(args)
     train(args)

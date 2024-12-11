@@ -3,6 +3,7 @@
 import numpy as np, os, random, json, math, wandb
 from tqdm import trange
 from typing import List, Dict, Tuple
+import ray
 from copy import deepcopy
 
 try:
@@ -41,8 +42,17 @@ def verbose_print(s: str, verbose: bool):
 class OstOrAnswerGenerator:
     """Generator generates children nodes"""
 
-    def __init__(self, args, tokenizer, model, evaluator: Evaluator, vllm_generator, experience_maker) -> None:
-        self.experience_maker = experience_maker
+    def __init__(self, 
+            args, tokenizer, model, evaluator: Evaluator, 
+            vllm_generator, reward_model, mcts_use_prm: bool=False, 
+            enable_go_explore: bool=False, correct_step_thres: float=1.0,
+            multi_step_one_node: bool=False
+        ) -> None:
+        self.enable_go_explore = enable_go_explore
+        self.mcts_use_prm = mcts_use_prm
+        self.correct_step_thres = correct_step_thres
+
+        self.reward_model = reward_model
         self.io = IO_System(args, tokenizer, model, vllm_generator)
         self.evaluator = evaluator
         self.num_subquestions = args.num_subquestions
@@ -496,24 +506,71 @@ class OstOrAnswerGenerator:
                 instruction=user_question,
             )
             + existing_ost_steps
-            # + f"Step {next_ost_step_id}:"
-            + give_final_answer
-            # + f"Give the next step or the final answer:" 
-            #  Step {next_ost_step_id}:
+            # + give_final_answer
         )
-        io_output_list = self.io.generate(
-            model_input=io_input, max_tokens=256, num_return=self.num_a1_steps, stop_tokens=["\n", "\n\n"]
-        )
-        if last_step:
-            ost_step_list = ["The answer is:"+io_output.strip() for io_output in io_output_list]
-            qa_list = [user_question+f"\nLet's think step by step.\n"+existing_ost_steps+io_output for io_output in io_output_list]
-            values_list = self.experience_maker.get_reward_prm_as_orm(qa_list)
+        if self.enable_go_explore:
+            # 使生成完整答案
+            max_tokens = self.max_tokens
+            stop_tokens = self.fewshot_cot_config["stop_tokens"]
         else:
+            io_input += give_final_answer
+            max_tokens = 256
+            stop_tokens = ["\n", "\n\n"]
+        io_output_list = self.io.generate(
+            model_input=io_input, max_tokens=max_tokens, num_return=self.num_a1_steps, stop_tokens=stop_tokens
+        )
+
+        if self.enable_go_explore:
             ost_step_list = [io_output.strip() for io_output in io_output_list]
-            values_list = [None]*len(ost_step_list)
-            for i in range(len(ost_step_list)):
-                if "answer is" in ost_step_list[i].lower():
-                    values_list[i] = self.experience_maker.get_reward_prm_as_orm([user_question+f"\nLet's think step by step.\n"+existing_ost_steps+ost_step_list[i]])[0]
+            solutions_list = [f"Let's think step by step.\n"+existing_ost_steps+"\n"+io_output for io_output in io_output_list]
+            rewards_res_ref = self.reward_model.get_prm_q_a_res.remote(user_question, solutions_list)
+            rewards_res = ray.get(rewards_res_ref)
+            step_rewards_2d = rewards_res['step_rewards_2d']
+            split_q_responses = rewards_res['split_q_responses']
+            split_responses = [split_q_res[1:] for split_q_res in split_q_responses]
+            # 找到第一个低于correct_step_thres 的步骤idx
+            lt_correct_idxs = []
+            for step_rewards in step_rewards_2d:
+                first_error_step_idx = -1
+                for step_i, reward in enumerate(step_rewards):
+                    if reward < self.correct_step_thres:
+                        first_error_step_idx = step_i
+                        break
+                if first_error_step_idx == -1:
+                    # 至少取一步
+                    first_error_step_idx = 1
+                lt_correct_idxs.append(first_error_step_idx)
+
+            ost_step_list = []
+            for resp_i, first_error_step_idx in enumerate(lt_correct_idxs):
+                ost_step_list.append(
+                    ''.join(split_responses[resp_i][:first_error_step_idx]).strip()
+                )
+
+        else:
+            # TODO: prm 可以在中间节点直接计算value返回
+            if self.mcts_use_prm:
+                ost_step_list = [io_output.strip() for io_output in io_output_list]
+                qa_list = [user_question+f"\nLet's think step by step.\n"+existing_ost_steps+"\n"+give_final_answer+io_output for io_output in io_output_list]
+                rewards_ref = self.reward_model.get_orm_from_prm.remote(qa_list)
+                rewards = ray.get(rewards_ref)
+                values_list = rewards
+            else:
+                if last_step:
+                    ost_step_list = ["The answer is:"+io_output.strip() for io_output in io_output_list]
+                    qa_list = [user_question+f"\nLet's think step by step.\n"+existing_ost_steps+io_output for io_output in io_output_list]
+                    rewards_ref = self.reward_model.get_orm_from_prm.remote(qa_list)
+                    rewards = ray.get(rewards_ref)
+                    values_list = rewards
+                else:
+                    ost_step_list = [io_output.strip() for io_output in io_output_list]
+                    values_list = [None]*len(ost_step_list)
+                    for i in range(len(ost_step_list)):
+                        if "answer is" in ost_step_list[i].lower():
+                            # [1,]
+                            rewards_ref = self.reward_model.get_orm_from_prm.remote([user_question+f"\nLet's think step by step.\n"+existing_ost_steps+ost_step_list[i]])
+                            rewards = ray.get(rewards_ref)
+                            values_list[i] = rewards[0]
 
         #! generate potential answer to the user question
         potential_answers_list: List[List[str]] = []  # essentially direct answer list
@@ -968,7 +1025,6 @@ class OstOrAnswerNode(MCTS_Node):
         
         def do_action_generate_ost_or_final_answer(parent_is_subquestion=False, last_step=False):
             verbose_print(f"---- Generating one-step thought steps or give final answer for node {self.id}...", self.verbose)
-
             #! ACTION: generate one-step thought step
             ost_step_list, potential_answers_list, values_list = self.generator.generate_ost_step_or_final_answer(
                 user_question=self.user_question,
