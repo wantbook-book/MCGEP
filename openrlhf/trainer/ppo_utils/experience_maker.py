@@ -799,7 +799,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         return experience
     
     def make_experience_mcts(self, samples: Samples) -> Experience:
-        breakpoint()
         km_token = 'ки'
         km_token_id1 = 12902
         km_token_id2 = 1107
@@ -946,8 +945,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
         _critic_attention_mask = []
         for i, mask in enumerate(critic_attention_mask):
-            breakpoint()
-            _critic_attention_mask.extend(mask*(i+1))
+            # _critic_attention_mask.extend(mask*(i+1))
+            _critic_attention_mask.extend([v*(i+1) for v in mask])
         critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
         r_ref = self.reward_model[0].forward.remote(critic_encoded_sequences, critic_attention_mask, packed_seq_lens=critic_packed_seq_lens)
         rewards = ray.get(r_ref)
@@ -1027,47 +1026,56 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             offset += length
         decoded_sequences = self.tokenizer.batch_decode(sequences_split, skip_special_tokens=False)
         # decoded_sequences = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
-        decoded_sequences = [seq.replace(km_token, ' ') + km_token for seq in decoded_sequences]
-        critic_inputs = self.tokenize_fn(decoded_sequences, self.prompt_max_len*10, device='cuda', tokenizer=self.critic_tokenizer, padding=False)
-        critic_encoded_sequences = critic_inputs['input_ids']
-        critic_attention_mask = critic_inputs['attention_mask']
-        critic_packed_seq_lens = []
-        # sequences 是二维的，获取每行长度，作为critic_packed_seq_lens
-        for seq in critic_encoded_sequences:
-            critic_packed_seq_lens.append(len(seq))
-        # 展平critic_encoded_sequences, critic_encoded_mask为一维
-        _critic_encoded_sequences = []
-        for seq in critic_encoded_sequences:
-            _critic_encoded_sequences.extend(seq)
-        critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
-        _critic_attention_mask = []
-        # TODO: 不太对, 确认一下
-        for i, mask in enumerate(critic_attention_mask):
-            breakpoint()
-            _critic_attention_mask.extend(mask*(i+1))
-        critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
+        # decoded_sequences = [seq.replace(km_token, ' ') + km_token for seq in decoded_sequences]
+        # critic_inputs = self.tokenize_fn(decoded_sequences, self.prompt_max_len*10, device='cuda', tokenizer=self.critic_tokenizer, padding=False)
+        # critic_encoded_sequences = critic_inputs['input_ids']
+        # critic_attention_mask = critic_inputs['attention_mask']
+        # critic_packed_seq_lens = []
+        # # sequences 是二维的，获取每行长度，作为critic_packed_seq_lens
+        # for seq in critic_encoded_sequences:
+        #     critic_packed_seq_lens.append(len(seq))
+        # # 展平critic_encoded_sequences, critic_encoded_mask为一维
+        # _critic_encoded_sequences = []
+        # for seq in critic_encoded_sequences:
+        #     _critic_encoded_sequences.extend(seq)
+        # critic_encoded_sequences = torch.tensor(_critic_encoded_sequences).unsqueeze(0)
+        # _critic_attention_mask = []
+        # # TODO: 不太对, 确认一下
+        # for i, mask in enumerate(critic_attention_mask):
+        #     # mask*(i+1) 
+        #     _critic_attention_mask.extend([v*(i+1) for v in mask])
+        # critic_attention_mask = torch.tensor(_critic_attention_mask).unsqueeze(0)
         r_refs = []
         # support remote RM API with ray
-        if not self.remote_rm_url:
-            for rm in self.reward_model:
-                r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
-        else:
-            # remote RM
-            for rm in self.remote_rm_url:
-                if not self.packing_samples:
-                    queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
-                    r = remote_rm_fn_ray.remote(rm, queries=queries)
-                    r_refs.append(r)
-                else:
-                    sequences_list = []
-                    offset = 0
-                    tokens_list = sequences_cpu.tolist()[0]
-                    for length in packed_seq_lens:
-                        sequences_list.append(tokens_list[offset : offset + length])
-                        offset += length
-                    queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
-                    r = remote_rm_fn_ray.remote(rm, queries=queries)
-                    r_refs.append(r)
+        # if not self.remote_rm_url:
+        #     for rm in self.reward_model:
+        #         r_refs.append(rm.forward.remote(sequences_cpu, attention_mask_cpu, packed_seq_lens=packed_seq_lens))
+        # else:
+        #     # remote RM
+        #     for rm in self.remote_rm_url:
+        #         if not self.packing_samples:
+        #             queries = self.tokenizer.batch_decode(sequences_cpu, skip_special_tokens=False)
+        #             r = remote_rm_fn_ray.remote(rm, queries=queries)
+        #             r_refs.append(r)
+        #         else:
+        #             sequences_list = []
+        #             offset = 0
+        #             tokens_list = sequences_cpu.tolist()[0]
+        #             for length in packed_seq_lens:
+        #                 sequences_list.append(tokens_list[offset : offset + length])
+        #                 offset += length
+        #             queries = self.tokenizer.batch_decode(sequences_list, skip_special_tokens=False)
+        #             r = remote_rm_fn_ray.remote(rm, queries=queries)
+        #             r_refs.append(r)
+        # get prm as orm
+        rewards_ref = self.reward_model[0].get_orm_from_prm.remote(decoded_sequences)
+        # list[float]
+        rewards = ray.get(rewards_ref)
+        # rewards = [r.to(device) for r in rewards]
+        # r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
+        r = torch.tensor(rewards).reshape(-1, 1).to(device)
+
+        # get prm as orm
 
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask, packed_seq_lens=packed_seq_lens)
@@ -1075,15 +1083,14 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
 
         # wait initial/critic/reward model done
         start = time.time()
-        ref_values = ray.get([base_action_log_probs_ref, value_ref] + r_refs)
+        ref_values = ray.get([base_action_log_probs_ref, value_ref])
         wait_time = time.time() - start
-        base_action_log_probs, value, rewards = ref_values[0], ref_values[1], ref_values[2:]
+        base_action_log_probs, value = ref_values[0], ref_values[1]
 
         base_action_log_probs = base_action_log_probs.to(device)
         if value is not None:
             value = value.to(device)
-        rewards = [r.to(device) for r in rewards]
-        r = self.reward_fn(rewards) if len(rewards) > 0 else rewards[0]
+        
 
         # avoid CUDA OOM when colocate models
         if self.strategy.args.colocate_critic_reward and not self.remote_rm_url:
@@ -1121,8 +1128,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
-            "token_counter": sum(samples.token_counters)/len(samples.token_counters),
-            "call_counter": sum(samples.call_counters)/len(samples.call_counters),
+            "token_counter": torch.tensor(samples.token_counters, dtype=torch.float32),
+            "call_counter": torch.tensor(samples.call_counters, dtype=torch.float32),
         }
         if kl is not None:
             info['kl'] = kl_mean
@@ -1469,7 +1476,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             # 计数器归零
             self.generator.io.call_counter = 0
             self.generator.io.token_counter = 0
-
             gt_answer = self.evaluator.extract_answer_from_gold_solution(gt_solution)
             #! build an MCTS searcher
             mcts_searcher = MCTS_Searcher(
@@ -1557,7 +1563,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             all_node_solutions.append(solution_nodes)
             all_token_counter.append(self.generator.io.token_counter)
             all_call_counter.append(self.generator.io.call_counter)
-        breakpoint()
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             model_solutions = all_model_solutions[i:i+args.micro_rollout_batch_size]
             node_solutions = all_node_solutions[i:i+args.micro_rollout_batch_size]

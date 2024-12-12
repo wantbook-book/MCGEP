@@ -24,6 +24,7 @@ from mcts.run_src.rstar_utils import (
     reach_terminal_ost_step,
     concat_subqs_and_subas,
     concat_ost_steps,
+    concat_multist_steps,
     concat_subqs_subas_as_ost_steps,
     make_hint,
     make_response_prefix,
@@ -51,6 +52,7 @@ class OstOrAnswerGenerator:
         self.enable_go_explore = enable_go_explore
         self.mcts_use_prm = mcts_use_prm
         self.correct_step_thres = correct_step_thres
+        self.multi_step_one_node = multi_step_one_node
 
         self.reward_model = reward_model
         self.io = IO_System(args, tokenizer, model, vllm_generator)
@@ -498,7 +500,10 @@ class OstOrAnswerGenerator:
         if parent_is_subquestion:
             existing_ost_steps, next_ost_step_id = concat_subqs_subas_as_ost_steps(solution_trace)
         else:
-            existing_ost_steps, next_ost_step_id = concat_ost_steps(solution_trace)
+            if self.mcts_use_prm and self.multi_step_one_node:
+                existing_ost_steps, next_ost_step_id = concat_multist_steps(solution_trace)
+            else:
+                existing_ost_steps, next_ost_step_id = concat_ost_steps(solution_trace)
         give_final_answer = f"Step {next_ost_step_id}:" if not last_step else "The answer is:"
         io_input = (
             self.fewshot_ost_config["prompt_template"].format(
@@ -508,7 +513,7 @@ class OstOrAnswerGenerator:
             + existing_ost_steps
             # + give_final_answer
         )
-        if self.enable_go_explore:
+        if self.multi_step_one_node:
             # 使生成完整答案
             max_tokens = self.max_tokens
             stop_tokens = self.fewshot_cot_config["stop_tokens"]
@@ -520,33 +525,46 @@ class OstOrAnswerGenerator:
             model_input=io_input, max_tokens=max_tokens, num_return=self.num_a1_steps, stop_tokens=stop_tokens
         )
 
-        if self.enable_go_explore:
-            ost_step_list = [io_output.strip() for io_output in io_output_list]
-            solutions_list = [f"Let's think step by step.\n"+existing_ost_steps+"\n"+io_output for io_output in io_output_list]
-            rewards_res_ref = self.reward_model.get_prm_q_a_res.remote(user_question, solutions_list)
-            rewards_res = ray.get(rewards_res_ref)
-            step_rewards_2d = rewards_res['step_rewards_2d']
-            split_q_responses = rewards_res['split_q_responses']
-            split_responses = [split_q_res[1:] for split_q_res in split_q_responses]
-            # 找到第一个低于correct_step_thres 的步骤idx
-            lt_correct_idxs = []
-            for step_rewards in step_rewards_2d:
-                first_error_step_idx = -1
-                for step_i, reward in enumerate(step_rewards):
-                    if reward < self.correct_step_thres:
-                        first_error_step_idx = step_i
-                        break
-                if first_error_step_idx == -1:
-                    # 至少取一步
-                    first_error_step_idx = 1
-                lt_correct_idxs.append(first_error_step_idx)
+        if self.multi_step_one_node:
+            try:
+                ost_step_list = [io_output.strip() for io_output in io_output_list]
+                # TODO: 得和下面reward_model里面的sep_token一致
+                new_step_generate_nums = [len([step for step in ost_step.split('\n') if step != '']) for ost_step in ost_step_list]
 
-            ost_step_list = []
-            for resp_i, first_error_step_idx in enumerate(lt_correct_idxs):
-                ost_step_list.append(
-                    ''.join(split_responses[resp_i][:first_error_step_idx]).strip()
-                )
+                solutions_list = [f"Let's think step by step.\n"+existing_ost_steps+"\n"+io_output for io_output in io_output_list]
+                rewards_res_ref = self.reward_model.get_prm_q_a_res.remote(user_question, solutions_list)
+                rewards_res = ray.get(rewards_res_ref)
+                step_rewards_2d = rewards_res['step_rewards_2d']
+                split_q_responses = rewards_res['split_q_responses']
+                # split_responses = [split_q_res[1:] for split_q_res in split_q_responses]
+                # 找到第一个低于correct_step_thres 的步骤idx
+                lt_correct_idxs = []
+                values_list = []
+                for solution_i, step_rewards in enumerate(step_rewards_2d):
+                    first_error_step_idx = -1
+                    new_step_generate_num = new_step_generate_nums[solution_i]
+                    for step_i, reward in enumerate(step_rewards):
+                        if reward < self.correct_step_thres:
+                            first_error_step_idx = step_i
+                            break
+                    else:
+                        first_error_step_idx = len(step_rewards)
+                        print('all steps are perfect!')
+                    if first_error_step_idx <= len(step_rewards)-new_step_generate_num:
+                        # TODO: 至少取一步新生成的？
+                        first_error_step_idx = len(step_rewards)-new_step_generate_num+1
+                        # 出错前的最后一步reward
+                    values_list.append(step_rewards[first_error_step_idx-1])
+                    lt_correct_idxs.append(first_error_step_idx)
 
+                ost_step_list = []
+                for resp_i, first_error_step_idx in enumerate(lt_correct_idxs):
+                    exist_step_num = len(step_rewards_2d[resp_i])-new_step_generate_nums[resp_i]
+                    ost_step_list.append(
+                        ''.join(split_q_responses[resp_i][exist_step_num:first_error_step_idx]).strip()
+                    )
+            except Exception as e:
+                breakpoint()
         else:
             # TODO: prm 可以在中间节点直接计算value返回
             if self.mcts_use_prm:
@@ -1044,6 +1062,8 @@ class OstOrAnswerNode(MCTS_Node):
                         potential_answers=deepcopy(potential_answers),
                     )
                 )
+            if not self.children:
+                breakpoint()
         #! create children
         # if self.node_type is Node_Type.USER_QUESTION:
         #     # A1: Propose an one-step thought.
@@ -1106,7 +1126,8 @@ class OstOrAnswerNode(MCTS_Node):
         #     do_action_generate_direct_answers()
         # else:
         do_action_generate_ost_or_final_answer(last_step=last_step)
-
+        if not self.children:
+            breakpoint()
         assert self.children
         return self.children
 

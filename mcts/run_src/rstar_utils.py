@@ -156,6 +156,19 @@ def concat_ost_steps(solution_trace: Dict[int, Dict[str, str]]) -> Tuple[str, in
         # no one-step thought step yet
         return "", 1
 
+def concat_multist_steps(solution_trace: Dict[int, Dict[str, str]]) -> Tuple[str, int]:
+    """Return: concatenated one-step thought steps, next one-step thought step id"""
+    last_tuple = list(solution_trace.items())[-1]
+    last_tuple_id, last_tuple_recording = last_tuple[0], last_tuple[1]
+    assert "ost_step" in last_tuple_recording.keys()
+    if len(last_tuple_recording["ost_step"]) > 0:
+        solution_trace_str = ""
+        for step_id, step_text in last_tuple_recording["ost_step"].items():
+            solution_trace_str += step_text + "\n"
+        return solution_trace_str, step_id + 1
+    else:
+        # no one-step thought step yet
+        return "", 1
 
 def concat_subqs_subas_as_ost_steps(solution_trace: Dict[int, Dict[str, str]]) -> Tuple[str, int]:
     """Return: concatenated subqs and subas as one-step thought steps, next one-step thought step id"""

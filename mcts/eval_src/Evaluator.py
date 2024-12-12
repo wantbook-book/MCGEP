@@ -332,8 +332,18 @@ class MATHEvaluator(Evaluator):
                 retval = string[idx : right_brace_idx + 1]
 
             return retval
+        
+        #TODO: why is None
+        gt_answer = remove_boxed(last_boxed_only_string(solution))
+        # if gt_answer is None:
+        #     gt_answer = 'xxx'
+        #     with open('gt_answer_is_None.txt', 'a+') as f:
+        #         f.write('='*100+'\n')
+        #         f.write(solution + '\n')
+        #         f.write('-'*100+'\n')
+        #         f.write(gt_answer + '\n\n')
 
-        return remove_boxed(last_boxed_only_string(solution))
+        return gt_answer
 
     def extract_answer_from_model_completion(self, completion):
         answer_split = self.isolate_answer(completion)
