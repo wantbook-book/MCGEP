@@ -291,8 +291,11 @@ class RewardModelRayActor(BasePPORole):
             step_reward = []
             for split_len in one_split_lens:
                 idx = start + split_len - 1
-                step_reward.append(step_rewards[step_i].item())
-                rewards[0, idx] = step_rewards[step_i]
+                try:
+                    step_reward.append(step_rewards[step_i].item())
+                    rewards[0, idx] = step_rewards[step_i]
+                except Exception as e:
+                    breakpoint()
                 start += split_len
                 step_i += 1
             step_rewards_2d.append(step_reward)
